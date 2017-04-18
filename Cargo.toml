@@ -1,0 +1,6 @@
+[package]
+name = "quentin"
+version = "0.1.0"
+authors = ["Mike Thvedt <mike.thvedt@gmail.com>"]
+
+[dependencies]
