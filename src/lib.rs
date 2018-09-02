@@ -1,8 +1,9 @@
-//! Quentin: stupidly fast context-free grammar parsers.
+/*!
+Quentin: stupidly fast context-free grammar parsers.
+!*/
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-    }
-}
+extern crate typed_arena;
+
+pub mod util;
+
+pub mod rule;

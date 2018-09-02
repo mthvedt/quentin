@@ -4,3 +4,5 @@ version = "0.1.0"
 authors = ["Mike Thvedt <mike.thvedt@gmail.com>"]
 
 [dependencies]
+typed-arena = "1.4.1"
+# thunk = "0.3"
