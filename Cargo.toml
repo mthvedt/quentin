@@ -4,5 +4,9 @@ version = "0.1.0"
 authors = ["Mike Thvedt <mike.thvedt@gmail.com>"]
 
 [dependencies]
+lazy_static = "1.1.0"
 typed-arena = "1.4.1"
 # thunk = "0.3"
+
+[features]
+example = []

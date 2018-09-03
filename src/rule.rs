@@ -2,12 +2,16 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use util::refs::{ShallowRef, DeepRef};
 
 use typed_arena::Arena;
 
-pub trait Rule {
+/*
+Rule implements Sync so it can safely be used by lazy_static.
+*/
+pub trait Rule: Sync {
     fn build_item(&self, g: &'static mut Graph) -> Item;
 }
 
@@ -19,7 +23,7 @@ type RuleRef = ShallowRef<'static, Rule>;
 pub enum Combinator {
     Seq(ItemThunk, ItemThunk),
     Choice(Vec<ItemThunk>),
-    Term(i8),
+    Term(u8),
     Done,
     Empty,
 }
@@ -113,12 +117,19 @@ impl Graph {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Seq {
     // Seqs are never passthrough
     rules: &'static [&'static Rule],
 }
 
 impl Seq {
+    pub fn new(rules: &'static [&'static Rule]) -> Seq {
+        Seq {
+            rules: rules,
+        }
+    }
+
     fn build_item_from_rules(rules: &'static [&'static Rule], g: &'static Graph) -> Item {
         Item {
             combinator: if rules.len() == 0 {
@@ -141,9 +152,25 @@ impl Rule for Seq {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Choice {
     rules: &'static [&'static Rule],
     passthrough: bool,
+}
+
+impl Choice {
+    pub fn new(rules: &'static [&'static Rule]) -> Choice {
+        Choice {
+            rules: rules,
+            passthrough: false,
+        }
+    }
+
+    pub fn passthrough(&self) -> Choice {
+        let mut r = *self;
+        r.passthrough = true;
+        r
+    }
 }
 
 impl Rule for Choice {
@@ -156,9 +183,18 @@ impl Rule for Choice {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Term {
-    val: i8,
+    val: u8,
     // Terms are never passthrough
+}
+
+impl Term {
+    pub fn new(val: u8) -> Term {
+        Term {
+            val: val,
+        }
+    }
 }
 
 impl Rule for Term {
@@ -166,6 +202,37 @@ impl Rule for Term {
         Item {
             combinator: Combinator::Term(self.val),
             passthrough: false,
+        }
+    }
+}
+
+pub struct Thunk {
+    t: RwLock<Option<&'static Rule>>,
+    // Thunks are always passthrough
+}
+
+impl Thunk {
+    pub fn new() -> Thunk {
+        Thunk {
+            t: RwLock::new(None),
+        }
+    }
+
+    pub fn get(&self) -> &'static Rule {
+        (&*self.t.read().unwrap()).unwrap()
+    }
+
+    pub fn set(&self, rule: &'static Rule) {
+        let mut v = self.t.write().unwrap();
+        *v = Some(rule);
+    }
+}
+
+impl Rule for Thunk {
+    fn build_item(&self, g: &'static mut Graph) -> Item {
+        Item {
+            combinator: Combinator::Choice(vec!(g.item_thunk(self.get()))),
+            passthrough: true,
         }
     }
 }
