@@ -1,184 +1,159 @@
 //! Rules in a context-free grammar.
 
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use util::arena::{ForwardArena, ForwardRef};
 
-use util::refs::{ShallowRef, DeepRef};
+pub type ItemRef<'a> = ForwardRef<'a, Item<'a>>;
 
-use typed_arena::Arena;
-
-/*
-Rule implements Sync so it can safely be used by lazy_static.
-*/
-pub trait Rule: Sync {
-    fn build_item(&self, g: &'static mut Graph) -> Item;
+pub trait Rule {
+    fn build_item<'a>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'a>) -> Item<'a>;
 }
 
-type RuleRef = ShallowRef<'static, Rule>;
+/// It's actually unsound in Rust to use trait references as keys!
+/// The reason references are partial keys is that
+/// a single struct might have two different trait implementations in scope in two different places,
+/// so the Trait pointer is not guaranteed to point to the same vtable.
+/// Even more generally, Rust may (and does) at its option
+/// generate two different vtables for the same implementation.
+#[derive(Clone, Copy)]
+pub enum RuleKey<'a> {
+    Ref(&'a Rule),
+    // This is 'static for now to avoid more lifetimes everywhere.
+    // Will generalize this key wholesale later.
+    Lookup(&'static str),
+}
 
-// TODO: can we hide this? trouble is Rule needs to know. We might not want to hide it
-// (instead hide through cfg module).
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub enum Combinator {
-    Seq(ItemThunk, ItemThunk),
-    Choice(Vec<ItemThunk>),
+pub trait AsRuleKey {
+    fn as_rule_key<'a>(&'a self) -> RuleKey<'a>;
+}
+
+impl<R: Rule> AsRuleKey for R {
+    fn as_rule_key<'a>(&'a self) -> RuleKey<'a> {
+        RuleKey::Ref(self)
+    }
+}
+
+impl AsRuleKey for &'static str {
+    fn as_rule_key<'a>(&'a self) -> RuleKey<'a> {
+        RuleKey::Lookup(self)
+    }
+}
+
+// TODO: Put rules in a context-free-grammar module, hide this in a generic Rule module.
+// TODO: generify this on some kind of key.
+pub enum Combinator<'a> {
+    Seq(ItemRef<'a>, ItemRef<'a>),
+    Choice(ItemRef<'a>, ItemRef<'a>),
     Term(u8),
     Done,
     Empty,
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct Item {
-    combinator: Combinator,
-    // line: String,
-    passthrough: bool,
-}
-
-type ItemRef = DeepRef<'static, Item>;
-
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub enum ItemThunk {
-    Real(ItemRef),
-    Thunk(RuleRef),
+pub enum Class {
+    Normal,
+    Passthrough,
+    Elide,
 }
 
-/*
-Graph exhibits interior mutability.
-The reason for this is Graph must outlive the lifetimes of the graph's interior references,
-which makes it difficult to write functions that may take a &mut Graph
-and cause new such references to exist.
-*/
-pub struct Graph {
-    inner: UnsafeCell<GraphInner>,
+pub struct Item<'a> {
+    combinator: Combinator<'a>,
+    class: Class,
 }
 
-pub struct GraphInner {
-    rule_to_thunk: HashMap<RuleRef, ItemThunk>,
-    item_alloc: Arena<Item>,
-    // TODO: we store items twice here.
-    // We can store them once if we're more creative with lifetimes,
-    // which we eventually will need to be.
-    // The problem is we need ItemRef to be contravariant in the lifetimes of its referents,
-    // so we can cast a short-lived ItemRef to an ItemRef<'static>.
-    // I think that's the problem anyway...
-    // Anyawy, these clones are expensive if a Choice is involved.
-    item_dedup: HashMap<Item, ItemRef>,
+struct WithClass<R: Rule> {
+    wrapped: R,
+    class: Class,
 }
 
-impl Graph {
-    // fn new() -> Self {
-    //     Graph {
-    //         inner: UnsafeCell::new(GraphInner {
-    //             rule_to_thunk: HashMap::new(),
-    //             item_alloc: Arena::new(),
-    //             item_dedup: HashMap::new(),
-    //         })
-    //     }
-    // }
-
-    fn doto<'a, T, F: FnOnce(&'a mut GraphInner) -> T>(&'a self, f: F) -> T {
-        let ptr = self.inner.get();
-        let intref = unsafe { &mut *ptr };
-        f(intref)
+impl<R: Rule> WithClass<R> {
+    fn new(wrapped: R, class: Class) -> Self {
+        Self {
+            wrapped: wrapped,
+            class: class,
+        }
     }
+}
 
-    fn item_thunk(&self, rule: &'static Rule) -> ItemThunk {
-        self.doto(|inner| {
-            let rref = RuleRef::new(rule);
-
-            match inner.rule_to_thunk.get(&rref).map(|v| *v) {
-                Some(r) => r,
-                None => {
-                    let t = ItemThunk::Thunk(rref);
-                    inner.rule_to_thunk.insert(rref, t);
-                    t
-                },
-            }
-        })
-    }
-
-    fn add_item_ref(&'static self, item: Item) -> ItemRef {
-        self.doto(|inner| {
-            match inner.item_dedup.get(&item).map(|v| *v) {
-                Some(i) => i,
-                None => {
-                    let raw_iref = inner.item_alloc.alloc(item.clone());
-                    let iref = ItemRef::new(raw_iref);
-                    inner.item_dedup.insert(item, iref);
-                    iref
-                }
-            }
-        })
-    }
-
-    fn add_item(&'static self, item: Item) -> ItemThunk {
-        ItemThunk::Real(self.add_item_ref(item))
+impl<R: Rule> Rule for WithClass<R> {
+    fn build_item<'a>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'a>) -> Item<'a> {
+        let item = self.wrapped.build_item(f);
+        Item {
+            combinator: item.combinator,
+            class: self.class,
+        }
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct Seq {
-    // Seqs are never passthrough
-    rules: &'static [&'static Rule],
+pub struct Seq<'a> {
+    rules: &'a [&'a AsRuleKey],
 }
 
-impl Seq {
-    pub fn new(rules: &'static [&'static Rule]) -> Seq {
-        Seq {
-            rules: rules,
-        }
+impl<'a> Seq<'a> {
+    pub fn new(rules: &'a [&'a AsRuleKey]) -> Self {
+        Seq { rules: rules }
     }
+}
 
-    fn build_item_from_rules(rules: &'static [&'static Rule], g: &'static Graph) -> Item {
+impl<'a> Rule for Seq<'a> {
+    fn build_item<'b>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'b>) -> Item<'b> {
         Item {
-            combinator: if rules.len() == 0 {
+            combinator: if self.rules.len() == 0 {
                 Combinator::Empty
             } else {
-                let i0ref = g.item_thunk(rules[0]);
-                let i1 = Seq::build_item_from_rules(&rules[1..], g);
-                let i1ref = g.add_item(i1);
-
-                Combinator::Seq(i0ref, i1ref)
+                Combinator::Seq(
+                    f(&self.rules[0].as_rule_key()),
+                    f(&RuleKey::Ref(&WithClass::new(
+                        Self::new(&self.rules[1..]),
+                        Class::Elide,
+                    ))),
+                )
             },
-            passthrough: false,
+            class: Class::Normal,
         }
     }
 }
 
-impl Rule for Seq {
-    fn build_item(&self, g: &'static mut Graph) -> Item {
-        Seq::build_item_from_rules(self.rules, g)
-    }
-}
-
 #[derive(Clone, Copy)]
-pub struct Choice {
-    rules: &'static [&'static Rule],
+pub struct Choice<'a> {
+    rules: &'a [&'a AsRuleKey],
     passthrough: bool,
 }
 
-impl Choice {
-    pub fn new(rules: &'static [&'static Rule]) -> Choice {
+impl<'a> Choice<'a> {
+    pub fn new(rules: &'a [&'a AsRuleKey]) -> Self {
         Choice {
             rules: rules,
             passthrough: false,
         }
     }
 
-    pub fn passthrough(&self) -> Choice {
+    pub fn passthrough(&self) -> Self {
         let mut r = *self;
         r.passthrough = true;
         r
     }
 }
 
-impl Rule for Choice {
-    fn build_item(&self, g: &'static mut Graph) -> Item {
+impl<'a> Rule for Choice<'a> {
+    fn build_item<'b>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'b>) -> Item<'b> {
         Item {
-            combinator: Combinator::Choice(
-                self.rules.iter().map(|rref| g.item_thunk(*rref)).collect()),
-            passthrough: self.passthrough,
+            combinator: if self.rules.len() == 0 {
+                Combinator::Empty
+            } else {
+                Combinator::Seq(
+                    f(&self.rules[0].as_rule_key()),
+                    f(&RuleKey::Ref(&WithClass::new(
+                        Self::new(&self.rules[1..]),
+                        Class::Elide,
+                    ))),
+                )
+            },
+            class: match self.passthrough {
+                true => Class::Passthrough,
+                false => Class::Normal,
+            },
         }
     }
 }
@@ -186,53 +161,103 @@ impl Rule for Choice {
 #[derive(Clone, Copy)]
 pub struct Term {
     val: u8,
-    // Terms are never passthrough
 }
 
 impl Term {
-    pub fn new(val: u8) -> Term {
-        Term {
-            val: val,
-        }
+    pub fn new(val: u8) -> Self {
+        Term { val: val }
     }
 }
 
 impl Rule for Term {
-    fn build_item(&self, _g: &'static mut Graph) -> Item {
+    fn build_item<'b>(&self, _f: &mut FnMut(&RuleKey) -> ItemRef<'b>) -> Item<'b> {
         Item {
             combinator: Combinator::Term(self.val),
-            passthrough: false,
+            class: Class::Normal,
         }
     }
 }
 
-pub struct Thunk {
-    t: RwLock<Option<&'static Rule>>,
-    // Thunks are always passthrough
+// FIXME: name
+pub struct Grammar<'a> {
+    map: HashMap<&'a str, &'a Rule>,
 }
 
-impl Thunk {
-    pub fn new() -> Thunk {
-        Thunk {
-            t: RwLock::new(None),
+impl<'a> Grammar<'a> {
+    pub fn new() -> Self {
+        Grammar {
+            map: HashMap::new(),
         }
     }
 
-    pub fn get(&self) -> &'static Rule {
-        (&*self.t.read().unwrap()).unwrap()
+    pub fn get(&self, k: &str) -> Option<&'a Rule> {
+        self.map.get(k).map(|r| *r)
     }
 
-    pub fn set(&self, rule: &'static Rule) {
-        let mut v = self.t.write().unwrap();
-        *v = Some(rule);
+    pub fn put(&mut self, name: &'a str, v: &'a Rule) -> Option<&'a Rule> {
+        self.map.insert(name, v)
     }
 }
 
-impl Rule for Thunk {
-    fn build_item(&self, g: &'static mut Graph) -> Item {
-        Item {
-            combinator: Combinator::Choice(vec!(g.item_thunk(self.get()))),
-            passthrough: true,
+pub struct ItemSetAllocator<'a> {
+    arena: ForwardArena<'a, Item<'a>>,
+}
+
+impl<'a> ItemSetAllocator<'a> {
+    pub fn new() -> Self {
+        Self {
+            arena: ForwardArena::new(),
         }
+    }
+}
+
+pub struct ItemSet<'a> {
+    root: &'a Item<'a>,
+}
+
+pub struct GrammarBuilder<'b, 'a: 'b, 'g: 'b> {
+    arena: &'a ForwardArena<'a, Item<'a>>,
+    lookup: HashMap<&'static str, ItemRef<'a>>,
+    grammar: &'b Grammar<'g>,
+}
+
+fn do_build_grammar<'b, 'a: 'b, 'g: 'b>(
+    r: &RuleKey,
+    b: &mut GrammarBuilder<'b, 'a, 'g>,
+) -> ItemRef<'a> {
+    match r {
+        RuleKey::Ref(rule) => {
+            let cell = b.arena.forward();
+            cell.set(rule.build_item(&mut |k| do_build_grammar(k, b)))
+        }
+        // TODO: return errors if absent
+        // map deref to get around borrow checker
+        RuleKey::Lookup(k) => match b.lookup.get(k).map(|v| *v) {
+            Some(pending) => pending,
+            None => {
+                let cell = b.arena.forward();
+                b.lookup.insert(k, cell.borrow());
+                cell.set(
+                    b.grammar
+                        .get(k)
+                        .unwrap()
+                        .build_item(&mut |k| do_build_grammar(k, b)),
+                )
+            }
+        },
+    }
+}
+
+pub fn build_items<'a>(r: &Rule, g: &Grammar, alloc: &'a ItemSetAllocator<'a>) -> ItemSet<'a> {
+    ItemSet {
+        root: do_build_grammar(
+            &RuleKey::Ref(r),
+            &mut GrammarBuilder {
+                arena: &alloc.arena,
+                lookup: HashMap::new(),
+                grammar: g,
+            },
+        ).get()
+            .unwrap(),
     }
 }

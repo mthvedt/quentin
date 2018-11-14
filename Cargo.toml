@@ -1,12 +1,11 @@
 [package]
 name = "quentin"
-version = "0.1.0"
+version = "0.0.1"
 authors = ["Mike Thvedt <mike.thvedt@gmail.com>"]
 
 [dependencies]
-lazy_static = "1.1.0"
+once_cell = "0.1.6"
 typed-arena = "1.4.1"
-# thunk = "0.3"
 
 [features]
 example = []

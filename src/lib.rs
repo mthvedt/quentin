@@ -2,14 +2,12 @@
 Quentin: stupidly fast context-free grammar parsers.
 !*/
 
-#[macro_use]
-extern crate lazy_static;
-
+extern crate once_cell;
 extern crate typed_arena;
 
-pub mod util;
+mod util;
 
 pub mod rule;
 
-// #[cfg(example)]
+#[cfg(test)]
 pub mod test;
