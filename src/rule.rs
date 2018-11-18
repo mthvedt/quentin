@@ -1,9 +1,22 @@
 //! Rules in a context-free grammar.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt;
+use std::rc::Rc;
+
 use util::arena::{ForwardArena, ForwardRef};
 
 pub type ItemRef<'a> = ForwardRef<'a, Item<'a>>;
+
+impl<'a> ItemRef<'a> {
+    fn do_write(&self, f: &mut fmt::Formatter, joiner: &str) -> fmt::Result {
+        match self.get() {
+            Some(item) => write!(f, "{}{}", joiner, item),
+            None => write!(f, "<unbuilt>"),
+        }
+    }
+}
 
 pub trait Rule {
     fn build_item<'a>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'a>) -> Item<'a>;
@@ -15,12 +28,12 @@ pub trait Rule {
 /// so the Trait pointer is not guaranteed to point to the same vtable.
 /// Even more generally, Rust may (and does) at its option
 /// generate two different vtables for the same implementation.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum RuleKey<'a> {
     Ref(&'a Rule),
-    // This is 'static for now to avoid more lifetimes everywhere.
+    // This is String for now to avoid more lifetimes everywhere.
     // Will generalize this key wholesale later.
-    Lookup(&'static str),
+    Lookup(Rc<String>),
 }
 
 pub trait AsRuleKey {
@@ -33,9 +46,15 @@ impl<R: Rule> AsRuleKey for R {
     }
 }
 
-impl AsRuleKey for &'static str {
+impl AsRuleKey for String {
     fn as_rule_key<'a>(&'a self) -> RuleKey<'a> {
-        RuleKey::Lookup(self)
+        RuleKey::Lookup(Rc::new(self.clone()))
+    }
+}
+
+impl<'x> AsRuleKey for &'x str {
+    fn as_rule_key<'a>(&'a self) -> RuleKey<'a> {
+        RuleKey::Lookup(Rc::new(String::from(*self)))
     }
 }
 
@@ -49,6 +68,26 @@ pub enum Combinator<'a> {
     Empty,
 }
 
+impl<'a> fmt::Display for Combinator<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Combinator::*;
+
+        match self {
+            Seq(a, b) => {
+                a.do_write(f, &"")?;
+                b.do_write(f, &" ")
+            }
+            Choice(a, b) => {
+                a.do_write(f, &"")?;
+                b.do_write(f, &"|")
+            }
+            Term(v) => write!(f, "({})", v),
+            Done => write!(f, "i"),
+            Empty => write!(f, "e"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub enum Class {
     Normal,
@@ -59,44 +98,50 @@ pub enum Class {
 pub struct Item<'a> {
     combinator: Combinator<'a>,
     class: Class,
+    name: String,
 }
 
-struct WithClass<R: Rule> {
-    wrapped: R,
-    class: Class,
-}
+impl<'a> fmt::Display for Item<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Class::*;
 
-impl<R: Rule> WithClass<R> {
-    fn new(wrapped: R, class: Class) -> Self {
-        Self {
-            wrapped: wrapped,
-            class: class,
+        match self.class {
+            Normal => write!(f, "[{}]", self.name),
+            Passthrough => self.combinator.fmt(f),
+            Elide => self.combinator.fmt(f),
         }
     }
 }
 
-impl<R: Rule> Rule for WithClass<R> {
+struct Elide<R: Rule>(R);
+
+impl<R: Rule> Rule for Elide<R> {
     fn build_item<'a>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'a>) -> Item<'a> {
-        let item = self.wrapped.build_item(f);
+        let item = self.0.build_item(f);
         Item {
             combinator: item.combinator,
-            class: self.class,
+            class: Class::Elide,
+            name: String::from("(elided)"),
         }
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct Seq<'a> {
+pub struct Seq<'a, Name: 'a> {
+    name: Name,
     rules: &'a [&'a AsRuleKey],
 }
 
-impl<'a> Seq<'a> {
-    pub fn new(rules: &'a [&'a AsRuleKey]) -> Self {
-        Seq { rules: rules }
+impl<'a, Name: 'a + Borrow<str> + Clone> Seq<'a, Name> {
+    pub fn new(name: Name, rules: &'a [&'a AsRuleKey]) -> Self {
+        Seq {
+            name: name,
+            rules: rules,
+        }
     }
 }
 
-impl<'a> Rule for Seq<'a> {
+impl<'a, Name: 'a + Borrow<str> + Clone> Rule for Seq<'a, Name> {
     fn build_item<'b>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'b>) -> Item<'b> {
         Item {
             combinator: if self.rules.len() == 0 {
@@ -104,39 +149,42 @@ impl<'a> Rule for Seq<'a> {
             } else {
                 Combinator::Seq(
                     f(&self.rules[0].as_rule_key()),
-                    f(&RuleKey::Ref(&WithClass::new(
-                        Self::new(&self.rules[1..]),
-                        Class::Elide,
-                    ))),
+                    f(&RuleKey::Ref(&Elide(Seq::new(
+                        "(elided)",
+                        &self.rules[1..],
+                    )))),
                 )
             },
             class: Class::Normal,
+            name: String::from(self.name.borrow()),
         }
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct Choice<'a> {
+pub struct Choice<'a, Name: 'a> {
+    name: Name,
     rules: &'a [&'a AsRuleKey],
     passthrough: bool,
 }
 
-impl<'a> Choice<'a> {
-    pub fn new(rules: &'a [&'a AsRuleKey]) -> Self {
+impl<'a, Name: 'a + Borrow<str> + Clone> Choice<'a, Name> {
+    pub fn new(name: Name, rules: &'a [&'a AsRuleKey]) -> Self {
         Choice {
+            name: name,
             rules: rules,
             passthrough: false,
         }
     }
 
     pub fn passthrough(&self) -> Self {
-        let mut r = *self;
+        let mut r = self.clone();
         r.passthrough = true;
         r
     }
 }
 
-impl<'a> Rule for Choice<'a> {
+impl<'a, Name: 'a + Borrow<str> + Clone> Rule for Choice<'a, Name> {
     fn build_item<'b>(&self, f: &mut FnMut(&RuleKey) -> ItemRef<'b>) -> Item<'b> {
         Item {
             combinator: if self.rules.len() == 0 {
@@ -144,16 +192,17 @@ impl<'a> Rule for Choice<'a> {
             } else {
                 Combinator::Seq(
                     f(&self.rules[0].as_rule_key()),
-                    f(&RuleKey::Ref(&WithClass::new(
-                        Self::new(&self.rules[1..]),
-                        Class::Elide,
-                    ))),
+                    f(&RuleKey::Ref(&Elide(Choice::new(
+                        "(elided)",
+                        &self.rules[1..],
+                    )))),
                 )
             },
             class: match self.passthrough {
                 true => Class::Passthrough,
                 false => Class::Normal,
             },
+            name: String::from(self.name.borrow()),
         }
     }
 }
@@ -174,11 +223,11 @@ impl Rule for Term {
         Item {
             combinator: Combinator::Term(self.val),
             class: Class::Normal,
+            name: String::from_utf8([self.val].to_vec()).unwrap(),
         }
     }
 }
 
-// FIXME: name
 pub struct Grammar<'a> {
     map: HashMap<&'a str, &'a Rule>,
 }
@@ -215,9 +264,15 @@ pub struct ItemSet<'a> {
     root: &'a Item<'a>,
 }
 
+impl<'a> fmt::Display for ItemSet<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.root.fmt(f)
+    }
+}
+
 pub struct GrammarBuilder<'b, 'a: 'b, 'g: 'b> {
     arena: &'a ForwardArena<'a, Item<'a>>,
-    lookup: HashMap<&'static str, ItemRef<'a>>,
+    lookup: HashMap<Rc<String>, ItemRef<'a>>,
     grammar: &'b Grammar<'g>,
 }
 
@@ -236,7 +291,7 @@ fn do_build_grammar<'b, 'a: 'b, 'g: 'b>(
             Some(pending) => pending,
             None => {
                 let cell = b.arena.forward();
-                b.lookup.insert(k, cell.borrow());
+                b.lookup.insert(k.clone(), cell.borrow());
                 cell.set(
                     b.grammar
                         .get(k)

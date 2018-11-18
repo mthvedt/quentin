@@ -46,10 +46,6 @@ pub struct ForwardCell<'a, T: 'a> {
 }
 
 impl<'a, T: 'a> ForwardCell<'a, T> {
-    pub fn get(&self) -> Option<&'a T> {
-        self.borrow().get()
-    }
-
     pub fn borrow(&self) -> ForwardRef<'a, T> {
         ForwardRef(self.cell)
     }
